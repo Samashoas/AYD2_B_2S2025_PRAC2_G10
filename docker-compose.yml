@@ -1,0 +1,49 @@
+services:
+  # Frontend service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend-app
+    ports:
+      - "5173:5173"
+    env_file:
+      - ./frontend/.env
+    depends_on:
+      - products-service
+      - categories-service
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Products service
+  products-service:
+    build:
+      context: ./Backend/products-service
+      dockerfile: Dockerfile
+    container_name: products-service
+    ports:
+      - "5001:5001"
+    env_file:
+      - ./Backend/products-service/.env
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Categories service
+  categories-service:
+    build:
+      context: ./Backend/categories-service
+      dockerfile: Dockerfile
+    container_name: categories-service
+    ports:
+      - "5002:5002"
+    env_file:
+      - ./Backend/categories-service/.env
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
