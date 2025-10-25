@@ -1,0 +1,12 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: frontend-app
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_PRODUCTS_API=http://127.0.0.1:5001/api
+      - VITE_CATEGORIES_API=http://127.0.0.1:5002/api
+    restart: unless-stopped

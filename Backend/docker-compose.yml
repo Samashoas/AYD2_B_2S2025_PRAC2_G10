@@ -1,0 +1,18 @@
+services:
+  products-service:
+    build: ./products-service
+    container_name: products_service
+    env_file:
+      - ./products-service/.env
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+
+  categories-service:
+    build: ./categories-service
+    container_name: categories_service
+    env_file:
+      - ./categories-service/.env
+    ports:
+      - "5002:5002"
+    restart: unless-stopped

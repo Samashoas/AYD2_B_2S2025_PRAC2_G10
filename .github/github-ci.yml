@@ -1,0 +1,276 @@
+name: CI/CD Pipeline - Restaurant Microservices
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  DOCKER_DRIVER: overlay2
+  IMAGE_CATEGORIES: dave965/categories-service-ayd2
+  IMAGE_PRODUCTS: dave965/products-service-ayd2
+  IMAGE_FRONTEND: dave965/frontend-ayd2
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.10.3
+
+jobs:
+  # ==================== BUILD STAGE ====================
+  build-backend:
+    name: Build Backend Microservices
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [categories-service, products-service]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v4
+        with:
+          context: ./Backend/${{ matrix.service }}
+          push: true
+          tags: |
+            dave965/${{ matrix.service }}-ayd2:latest
+            dave965/${{ matrix.service }}-ayd2:${{ github.sha }}
+          cache-from: type=registry,ref=dave965/${{ matrix.service }}-ayd2:buildcache
+          cache-to: type=registry,ref=dave965/${{ matrix.service }}-ayd2:buildcache,mode=max
+
+  build-frontend:
+    name: Build Frontend Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.IMAGE_FRONTEND }}:latest
+            ${{ env.IMAGE_FRONTEND }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache,mode=max
+
+  # ==================== TEST STAGE ====================
+  test-backend:
+    name: Test Backend Services
+    runs-on: ubuntu-latest
+    needs: build-backend
+    strategy:
+      matrix:
+        service: [categories-service, products-service]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies for ${{ matrix.service }}
+        working-directory: ./Backend/${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run tests for ${{ matrix.service }}
+        working-directory: ./Backend/${{ matrix.service }}
+        run: |
+          pytest --maxfail=5 --disable-warnings --cov=app --cov-report=xml --cov-report=html
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./Backend/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+          name: codecov-${{ matrix.service }}
+
+  test-frontend:
+    name: Test Frontend Application
+    runs-on: ubuntu-latest
+    needs: build-frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run linter
+        working-directory: ./frontend
+        run: npm run lint
+
+      - name: Type check
+        working-directory: ./frontend
+        run: npx tsc --noEmit
+
+  # ==================== DEPLOY INFRASTRUCTURE ====================
+  deploy-terraform:
+    name: Deploy Infrastructure with Terraform
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: ./terraform_files
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get EC2 Public IP
+        id: get-ip
+        run: |
+          echo "ec2_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+
+      - name: Wait for EC2 to be ready
+        run: sleep 60
+
+    outputs:
+      ec2_ip: ${{ steps.get-ip.outputs.ec2_ip }}
+
+  # ==================== DEPLOY APPLICATION ====================
+  deploy-ansible:
+    name: Deploy Application with Ansible
+    runs-on: ubuntu-latest
+    needs: deploy-terraform
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: ./ansible_files
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+
+      - name: Create SSH key file
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+
+      - name: Create Ansible inventory
+        run: |
+          echo "[web]" > inventory.ini
+          echo "${{ needs.deploy-terraform.outputs.ec2_ip }} ansible_user=ubuntu ansible_ssh_private_key_file=ssh_key.pem ansible_python_interpreter=/usr/bin/python3" >> inventory.ini
+          cat inventory.ini
+
+      - name: Test SSH connection
+        run: |
+          ansible web -i inventory.ini -m ping
+
+      - name: Deploy with Ansible
+        run: |
+          ansible-playbook -i inventory.ini site.yml -v
+
+      - name: Verify deployment
+        run: |
+          ansible web -i inventory.ini -m shell -a "docker ps"
+
+  # ==================== NOTIFICATIONS ====================
+  notify-success:
+    name: Notify Deployment Success
+    runs-on: ubuntu-latest
+    needs: deploy-ansible
+    if: success()
+    steps:
+      - name: Send success notification
+        run: |
+          echo "Deployment successful!"
+          echo "Application URL: http://${{ needs.deploy-terraform.outputs.ec2_ip }}"
+
+  notify-failure:
+    name: Notify Deployment Failure
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend, test-backend, test-frontend, deploy-terraform, deploy-ansible]
+    if: failure()
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Please check the logs for more details."
